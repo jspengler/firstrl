@@ -1,6 +1,7 @@
 import libtcodpy as libtcod
 import math
 import textwrap
+import shelve
 
 SCREEN_WIDTH = 80
 SCREEN_HEIGHT = 50
@@ -13,7 +14,7 @@ MAX_ROOMS = 30
 FOV_ALGO = 0
 FOV_LIGHT_WALLS = True
 TORCH_RADIUS = 10
-MAX_ROOM_MONSTERS = 5
+MAX_ROOM_MONSTERS = 2
 BAR_WIDTH = 20
 PANEL_HEIGHT = 7
 PANEL_Y = SCREEN_HEIGHT - PANEL_HEIGHT
@@ -22,13 +23,17 @@ MSG_WIDTH = SCREEN_WIDTH - BAR_WIDTH - 2
 MSG_HEIGHT = PANEL_HEIGHT -1
 MAX_ROOM_ITEMS = 2
 INVENTORY_WIDTH = 50
-HEAL_AMOUNT = 4
+HEAL_AMOUNT = 30
 LIGHTNING_RANGE = 5
 LIGHTNING_DAMAGE = 20
 CONFUSE_NUM_TURNS = 10
 CONFUSE_RANGE = 8
 FIREBALL_RADIUS = 3
 FIREBALL_DAMAGE= 12
+LEVEL_UP_BASE = 200
+LEVEL_UP_FACTOR = 150
+LEVEL_SCREEN_WIDTH = 40
+CHARACTER_SCREEN_WIDTH = 30
 
 game_state = 'playing'
 player_action = None
@@ -45,13 +50,14 @@ color_light_ground = libtcod.Color(200, 180, 50)
 class Object:
     # This is a generic object: a player, monster, item, dungeon feature, etc.
     # It is always represented by a character on the screen.
-    def __init__(self, x, y, char, name, color, blocks=False, fighter=None, ai=None, death_function = None, item=None):
+    def __init__(self, x, y, char, name, color, blocks=False, fighter=None, ai=None, death_function = None, item=None, always_visible=False):
         self.x = x
         self.y = y
         self.char = char
         self.color = color
         self.name = name
         self.blocks = blocks
+        self.always_visible = always_visible
 
         # Components
         self.fighter = fighter
@@ -72,7 +78,7 @@ class Object:
 
     def draw(self):
         # Set the color and then draw the character that represents this object at its current position.
-        if libtcod.map_is_in_fov(fov_map, self.x, self.y):
+        if libtcod.map_is_in_fov(fov_map, self.x, self.y) or (self.always_visible and map[self.x][self.y].explored):
             # Before drawing, make sure it's in player's FOV.
             libtcod.console_set_default_foreground(con, self.color)
             libtcod.console_put_char(con, self.x, self.y, self.char, libtcod.BKGND_NONE)
@@ -137,11 +143,12 @@ class Rect:
 
 class Fighter:
     # Combat related properties and methods.
-    def __init__(self, hp, defense, power, death_function=None):
+    def __init__(self, hp, defense, power, xp, death_function=None):
         self.max_hp = hp
         self.hp = hp
         self.defense = defense
         self.power = power
+        self.xp = xp
         self.death_function = death_function
 
     def take_damage(self, damage):
@@ -150,6 +157,8 @@ class Fighter:
             self.hp -= damage
             # Check for self death after taking damage.
             if self.hp <= 0:
+                if self.owner != player:  # Yield experience to the player.
+                    player.fighter.xp += self.xp
                 function = self.death_function
                 if function is not None:
                     function(self.owner)
@@ -236,6 +245,7 @@ def handle_keys():
     global game_state
     global fov_recompute
     global key
+    global stairs
 
     # key = libtcod.console_wait_for_keypress(True)
 
@@ -247,17 +257,27 @@ def handle_keys():
         return 'exit'
 
     if game_state == 'playing':
-        # Movement
-        if key.vk == libtcod.KEY_UP:
+        #movement keys
+        if key.vk == libtcod.KEY_UP or key.vk == libtcod.KEY_KP8:
             player_move_or_attack(0, -1)
-        elif key.vk == libtcod.KEY_DOWN:
+        elif key.vk == libtcod.KEY_DOWN or key.vk == libtcod.KEY_KP2:
             player_move_or_attack(0, 1)
-        elif key.vk == libtcod.KEY_LEFT:
+        elif key.vk == libtcod.KEY_LEFT or key.vk == libtcod.KEY_KP4:
             player_move_or_attack(-1, 0)
-        elif key.vk == libtcod.KEY_RIGHT:
+        elif key.vk == libtcod.KEY_RIGHT or key.vk == libtcod.KEY_KP6:
             player_move_or_attack(1, 0)
+        elif key.vk == libtcod.KEY_HOME or key.vk == libtcod.KEY_KP7:
+            player_move_or_attack(-1, -1)
+        elif key.vk == libtcod.KEY_PAGEUP or key.vk == libtcod.KEY_KP9:
+            player_move_or_attack(1, -1)
+        elif key.vk == libtcod.KEY_END or key.vk == libtcod.KEY_KP1:
+            player_move_or_attack(-1, 1)
+        elif key.vk == libtcod.KEY_PAGEDOWN or key.vk == libtcod.KEY_KP3:
+            player_move_or_attack(1, 1)
+        elif key.vk == libtcod.KEY_KP5 or chr(key.c) == '.':
+            return 'pass-turn'
         else:
-            # Test for other keyes.
+            # Test for other keys.
             key_char = chr(key.c)
             if key_char == 'g':
                 # Pick up an item.
@@ -275,6 +295,24 @@ def handle_keys():
                 chosen_item = inventory_menu('Press the key next to an item to drop it, or any other to cancel.\n')
                 if chosen_item is not None:
                     chosen_item.drop()
+            elif key_char == ',':
+                # Go down the stairs if the player is on them.
+                if stairs.x == player.x and stairs.y == player.y:
+                    next_level()
+                else:
+                    message('No stairs', libtcod.blue)
+            elif key_char == 'c':
+                # Display character info.
+                level_up_xp = LEVEL_UP_BASE + player.level * LEVEL_UP_FACTOR
+                msgbox(
+                    'Character Information\n' +
+                    '\nLevel: ' + str(player.level) +
+                    '\nExperience: ' + str(player.fighter.xp) +
+                    '\nExperience to level up: ' + str(level_up_xp) +
+                    '\n\nMaximum HP: ' + str(player.fighter.max_hp) +
+                    '\nAttack: ' + str(player.fighter.power) +
+                    '\nDefense: ' + str(player.fighter.defense),
+                    CHARACTER_SCREEN_WIDTH)
 
             return 'didnt-take-turn'
 
@@ -301,7 +339,7 @@ def player_move_or_attack(dx, dy):
         fov_recompute = True
 
 def make_map():
-    global map, player, objects
+    global map, player, objects, stairs
 
     # Make the objects list with just the player.
     objects = [player]
@@ -361,6 +399,12 @@ def make_map():
             # Finally append the new room to the list.
             rooms.append(new_room)
             num_rooms += 1
+    # Create stairs at the center of the last room.
+    stairs = Object(new_x, new_y, '<', 'stairs', libtcod.white, always_visible=True)
+    objects.append(stairs)
+    stairs.send_to_back() # So it's drawn below the monsters.
+
+
 
 def is_blocked(x,y):
     # First test the map tile.
@@ -405,14 +449,19 @@ def place_objects(room):
         y = libtcod.random_get_int(0, room.y1 + 1, room.y2 - 1)
 
         if not is_blocked(x, y):
-            if libtcod.random_get_int(0, 0, 100) < 80:    # 80% chance to get an orc
+            monster_chances = {
+                'orc': 80,
+                'troll': 20
+            }
+            choice = random_choice(monster_chances)
+            if choice == 'orc':
                 # Create an orc.
-                fighter_component = Fighter(hp=10, defense=0, power=3, death_function=monster_death)
+                fighter_component = Fighter(hp=10, defense=0, power=3, xp=35, death_function=monster_death)
                 ai_component = BasicMonster()
                 monster = Object(x, y, 'o', 'orc', libtcod.desaturated_green, blocks=True, fighter=fighter_component, ai=ai_component)
-            else:
+            elif choice == 'troll':
                 # Create a troll.
-                fighter_component = Fighter(hp=16, defense=1, power=4, death_function=monster_death)
+                fighter_component = Fighter(hp=16, defense=1, power=4, xp=100, death_function=monster_death)
                 ai_component = BasicMonster()
                 monster = Object(x, y, 'T', 'troll', libtcod.darker_green, blocks=True, fighter=fighter_component, ai=ai_component)
 
@@ -431,19 +480,19 @@ def place_objects(room):
             if dice < 40:
                 # Create a healing potion. (40% chance)
                 item_component = Item(use_function=cast_heal)
-                item = Object(x, y, '!', 'healing potion', libtcod.violet, item=item_component)
+                item = Object(x, y, '!', 'healing potion', libtcod.violet, item=item_component, always_visible=True)
             elif dice < 40 + 20:
                 # Create a lightning bolt scroll. (20% chance)
                 item_component = Item(use_function=cast_lightning)
-                item = Object(x, y, '?', 'scroll of lightning bolt', libtcod.light_yellow, item=item_component)
+                item = Object(x, y, '?', 'scroll of lightning bolt', libtcod.light_yellow, item=item_component, always_visible=True)
             elif dice < 40 + 20 + 20:
                 # Create a confusion scroll (20% chance)
                 item_component = Item(use_function=cast_confuse)
-                item = Object(x, y, '?', 'scroll of confusion', libtcod.light_yellow, item=item_component)
+                item = Object(x, y, '?', 'scroll of confusion', libtcod.light_yellow, item=item_component, always_visible=True)
             else:
                 # Create a fireball scroll (20% chance)
                 item_component = Item(use_function=cast_fireball)
-                item = Object(x, y, '?', 'scroll of fireball', libtcod.light_yellow, item=item_component)
+                item = Object(x, y, '?', 'scroll of fireball', libtcod.light_yellow, item=item_component, always_visible=True)
 
             objects.append(item)
             item.send_to_back()  # Items appear below other objects.
@@ -496,6 +545,9 @@ def render_all():
     # show the player's stats
     render_bar(1, 1, BAR_WIDTH, 'HP', player.fighter.hp, player.fighter.max_hp, libtcod.light_red, libtcod.darker_red)
 
+    # Show the dungeon level.
+    libtcod.console_print_ex(panel, 1, 3, libtcod.BKGND_NONE, libtcod.LEFT, 'Dungeon Level ' + str(dungeon_level))
+
     # Display names of objects under the mouse
     libtcod.console_set_default_foreground(panel, libtcod.light_grey)
     libtcod.console_print_ex(panel, 1, 0, libtcod.BKGND_NONE, libtcod.LEFT, get_names_under_mouse())
@@ -522,7 +574,7 @@ def player_death(player):
 
 def monster_death(monster):
     # Transform it into a nasty corpse! It doesn't block, can't be attacked, doesn't move.
-    message(monster.name.capitalize() + ' is dead!', libtcod.white)
+    message(monster.name.capitalize() + ' is dead! (' + str(monster.fighter.xp) + 'xp)', libtcod.orange)
     monster.char = '%'
     monster.color = libtcod.dark_red
     monster.blocks = False
@@ -704,13 +756,15 @@ def target_monster(max_range=None):
                 return obj
 
 def new_game():
-    global player, inventory, game_msgs, game_state
+    global player, inventory, game_msgs, game_state, dungeon_level
 
     # Create an object representing the player.
-    fighter_component = Fighter(hp=30, defense=2, power=5, death_function=player_death)
+    fighter_component = Fighter(hp=30, defense=2, power=5, xp=0, death_function=player_death)
     player = Object(0, 0, '@', 'player', libtcod.white, blocks=True, fighter=fighter_component)
+    player.level = 1
 
     # Generate a map (at this point it's not drawn to the screen)
+    dungeon_level = 1
     make_map()
     initialize_fov()
 
@@ -751,6 +805,8 @@ def play_game():
 
         libtcod.console_flush()
 
+        check_level_up()
+
         # Erase all objects at their old locations, before they move.
         for object in objects:
             object.clear()
@@ -758,6 +814,7 @@ def play_game():
         # Handle keys and exit game if needed.
         player_action = handle_keys()
         if player_action == 'exit':
+            save_game()
             break
 
         # Let monsters take their turn.
@@ -767,7 +824,8 @@ def play_game():
                     object.ai.take_turn()
 
 def main_menu():
-    #img = libtcod.image_load('menu_background.pg')
+    img = libtcod.image_load('menu_background1.png')
+    libtcod.image_blit_2x(img, 0, 0, 0)
 
     # Make a new mini-game-loop.
     while not libtcod.console_is_window_closed():
@@ -785,12 +843,98 @@ def main_menu():
         if choice == 0:  # Index of "play a new game"
             new_game()
             play_game()
+        elif choice == 1:  # Load last game
+            try:
+                load_game()
+            except:
+                msgbox('\n No saved game to load.\n', 24)
+                continue
+            play_game()
         elif choice == 2:  # Quit
             break
 
+def msgbox(text, width=50):
+    menu(text, [], width)  # Use the menu function as a message box.
 
+def save_game():
+    # Open a new empty shelf (possibly overwriting an old one) to write game data
+    file = shelve.open('savegame', 'n')
+    file['map'] = map
+    file['objects'] = objects
+    file['player_index'] = objects.index(player) #Index of the player in objects list
+    file['inventory'] = inventory
+    file['game_msgs'] = game_msgs
+    file['game_state'] = game_state
+    file['stairs_index'] = objects.index(stairs)
+    file['dungeon_level'] = dungeon_level
+    file.close()
 
+def load_game():
+    # Open the previously saved shelve and load the game data.
+    global map, objects, player, inventory, game_msgs, game_state, stairs, dungeon_level
+    file = shelve.open('savegame', 'r')
+    map = file['map']
+    objects = file['objects']
+    player = objects[file['player_index']] # Get index of player in objects list and access it.
+    inventory = file['inventory']
+    game_msgs = file['game_msgs']
+    game_state = file['game_state']
+    stairs = objects[file['stairs_index']]
+    dungeon_level = file['dungeon_level']
+    file.close()
+    initialize_fov()
 
+def next_level():
+    global dungeon_level
+    # Advance to the next level.
+    message('You take a moment to rest and recover your strength.', libtcod.light_violet)
+    player.fighter.heal(player.fighter.max_hp / 2)  # Heal the player by 50%.
+    message('You descend deeper into the heart of the dungeon...', libtcod.red)
+    dungeon_level += 1
+    make_map()  # Create a fresh level.
+    initialize_fov()
+
+def check_level_up():
+    # See if the player's experience is enough to level-up.
+    level_up_xp = LEVEL_UP_BASE + player.level * LEVEL_UP_FACTOR
+    if player.fighter.xp >= level_up_xp:
+        # Ding!
+        player.level += 1
+        player.fighter.xp -= level_up_xp
+        message('You grow stronger! You reached level ' + str(player.level) + '!', libtcod.yellow)
+        choice = None
+        while choice == None: # Keep asking until a choice is made.
+            choice = menu('Level up! Choose a stat to raise:\n',
+                          ['Constitution (+20 HP)',
+                           'Strength (+1 attack)',
+                           'Agility (+1 defense)'],
+                          LEVEL_SCREEN_WIDTH)
+            if choice == 0:
+                player.fighter.max_hp += 20
+                player.fighter.hp += 20
+            elif choice == 1:
+                player.fighter.power += 1
+            elif choice == 2:
+                player.fighter.defense += 1
+
+def random_choice_index(chances):
+    # Choose one option from a list of weighted choices, return its index.
+    dice = libtcod.random_get_int(0, 1, sum(chances))
+    # Go through all chances, keeping the sum so far.
+    running_sum = 0
+    choice = 0
+    for w in chances:
+        running_sum += w
+        # See if the dice landed in the part that corresponds to this choice.
+        if dice <= running_sum:
+            return choice
+        choice =+ 1
+
+def random_choice(chances_dictionary):
+    # Choose one option from dictionary of chances, returning its key.
+    chances = chances_dictionary.values()
+    strings = chances_dictionary.keys()
+    return strings[random_choice_index(chances)]
 
 ######################################
 # --- INITIALIZATION AND MAIN LOOP ---
